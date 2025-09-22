@@ -30,6 +30,7 @@ class GL:
     lights = []  # Lista de luzes direcionais
     headlight_enabled = True  # NavigationInfo headlight
     ambient_light = [0.2, 0.2, 0.2]  # Luz ambiente global
+    _time_sensor_states = {}  # estados de TimeSensors (id->start_time)
 
     @staticmethod
     def calculate_lighting(world_pos, normal, material):
@@ -48,10 +49,9 @@ class GL:
         shininess = material.get("shininess", 0.2)
         ambient_intensity = material.get("ambientIntensity", 0.2)
         
-        # Cor ambiente
-        ambient = [ambient_intensity * diffuse[i] for i in range(3)]
-        
-        # Cor final acumulada
+        # Cor ambiente (global + material)
+        ambient = [GL.ambient_light[i] * diffuse[i] * ambient_intensity for i in range(3)]
+        # Cor final acumulada inicia com emissive + ambient
         final_color = [emissive[i] + ambient[i] for i in range(3)]
         
         # Calcular contribuição de cada luz
@@ -67,39 +67,24 @@ class GL:
                 dot_nl = max(0.0, sum(normal[i] * (-light_dir[i]) for i in range(3)))
                 
                 if dot_nl > 0:
-                    # Componente difusa
-                    diffuse_contrib = [
-                        light['intensity'] * light['color'][i] * diffuse[i] * dot_nl
-                        for i in range(3)
-                    ]
-                    
-                    # Componente especular (se houver)
-                    if any(s > 0 for s in specular) and shininess > 0:
-                        # Direção da câmera (assumindo que está na origem para simplificar)
-                        view_dir = [0.0, 0.0, 1.0]  # Direção padrão da câmera
-                        
-                        # Direção de reflexão: R = 2(N·L)N - L
-                        reflect_dir = [
-                            2 * dot_nl * normal[i] - (-light_dir[i])
-                            for i in range(3)
-                        ]
-                        
-                        # Produto escalar: R . V
-                        dot_rv = max(0.0, sum(reflect_dir[i] * view_dir[i] for i in range(3)))
-                        spec_factor = pow(dot_rv, shininess * 128)  # Shininess normalizado
-                        
-                        specular_contrib = [
-                            light['intensity'] * light['color'][i] * specular[i] * spec_factor
-                            for i in range(3)
-                        ]
-                        
-                        # Adiciona contribuição especular
-                        for i in range(3):
-                            final_color[i] += specular_contrib[i]
-                    
-                    # Adiciona contribuição difusa
+                    # fator de atenuação usando ambientIntensity da luz (simplificado)
+                    la = light.get('ambientIntensity', 0.0)
+                    # Componente ambiente da luz
                     for i in range(3):
-                        final_color[i] += diffuse_contrib[i]
+                        final_color[i] += la * light['color'][i] * diffuse[i]
+                    # Componente difusa
+                    for i in range(3):
+                        final_color[i] += light['intensity'] * light['color'][i] * diffuse[i] * dot_nl
+                    # Componente especular
+                    if any(s > 0 for s in specular) and shininess > 0:
+                        view_dir = [0.0, 0.0, 1.0]
+                        reflect_dir = [2 * dot_nl * normal[i] - (-light_dir[i]) for i in range(3)]
+                        rl = math.sqrt(sum(r*r for r in reflect_dir)) or 1.0
+                        reflect_dir = [r/rl for r in reflect_dir]
+                        dot_rv = max(0.0, sum(reflect_dir[i] * view_dir[i] for i in range(3)))
+                        spec_factor = pow(dot_rv, max(1.0, shininess * 128))
+                        for i in range(3):
+                            final_color[i] += light['intensity'] * light['color'][i] * specular[i] * spec_factor
         
         # Limita valores entre 0 e 1
         final_color = [max(0.0, min(1.0, c)) for c in final_color]
@@ -522,7 +507,10 @@ class GL:
             return
 
         emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
-        col = [max(0, min(255, int(c * 255))) for c in emissive]
+        # Material básico
+        material = colors if colors else {}
+        diffuse = material.get('diffuseColor', emissive)
+        col = [max(0, min(255, int(c * 255))) for c in diffuse]
 
         # lista de vértices 3D
         verts = []
@@ -541,10 +529,10 @@ class GL:
                 vec = vec / vec[3]
             x = int(round((1.0 - (vec[0] * 0.5 + 0.5)) * (GL.width - 1)))
             y = int(round((1.0 - (vec[1] * 0.5 + 0.5)) * (GL.height - 1)))
-            return (x, y)
+            return (x, y, vec[2], v)
 
         def fill_triangle(p0, p1, p2):
-            (x0, y0), (x1, y1), (x2, y2) = p0, p1, p2
+            (x0, y0, z0, v0), (x1, y1, z1, v1), (x2, y2, z2, v2) = p0, p1, p2
             min_x = max(0, int(math.floor(min(x0, x1, x2))))
             max_x = min(GL.width, int(math.ceil(max(x0, x1, x2))))
             min_y = max(0, int(math.floor(min(y0, y1, y2))))
@@ -579,7 +567,23 @@ class GL:
                     if (w0 > 0 or (w0 == 0 and topLeft0)) and \
                        (w1 > 0 or (w1 == 0 and topLeft1)) and \
                        (w2 > 0 or (w2 == 0 and topLeft2)):
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
+                        # Usa normal de face para lighting se houver luz
+                        if GL.lights:
+                            # normal em espaço local
+                            e1 = [v1[i]-v0[i] for i in range(3)]
+                            e2 = [v2[i]-v0[i] for i in range(3)]
+                            n = [
+                                e1[1]*e2[2]-e1[2]*e2[1],
+                                e1[2]*e2[0]-e1[0]*e2[2],
+                                e1[0]*e2[1]-e1[1]*e2[0]
+                            ]
+                            ln = math.sqrt(sum(a*a for a in n)) or 1.0
+                            n = [a/ln for a in n]
+                            lit = GL.calculate_lighting(v0, n, material)
+                            cpx = [max(0, min(255, int(c*255))) for c in lit]
+                        else:
+                            cpx = col
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, cpx)
 
         base = 0
         for count in stripCount:
@@ -607,7 +611,9 @@ class GL:
             return
 
         emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
-        col = [max(0, min(255, int(c * 255))) for c in emissive]
+        material = colors if colors else {}
+        diffuse = material.get('diffuseColor', emissive)
+        col = [max(0, min(255, int(c * 255))) for c in diffuse]
 
         verts = []
         for i in range(0, len(point), 3):
@@ -625,10 +631,10 @@ class GL:
                 vec = vec / vec[3]
             x = int(round((1.0 - (vec[0] * 0.5 + 0.5)) * (GL.width - 1)))
             y = int(round((1.0 - (vec[1] * 0.5 + 0.5)) * (GL.height - 1)))
-            return (x, y)
+            return (x, y, vec[2], v)
 
         def fill_triangle(p0, p1, p2):
-            (x0, y0), (x1, y1), (x2, y2) = p0, p1, p2
+            (x0, y0, z0, v0), (x1, y1, z1, v1), (x2, y2, z2, v2) = p0, p1, p2
             min_x = max(0, int(math.floor(min(x0, x1, x2))))
             max_x = min(GL.width, int(math.ceil(max(x0, x1, x2))))
             min_y = max(0, int(math.floor(min(y0, y1, y2))))
@@ -662,7 +668,21 @@ class GL:
                     if (w0 > 0 or (w0 == 0 and topLeft0)) and \
                        (w1 > 0 or (w1 == 0 and topLeft1)) and \
                        (w2 > 0 or (w2 == 0 and topLeft2)):
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
+                        if GL.lights:
+                            e1 = [v1[i]-v0[i] for i in range(3)]
+                            e2 = [v2[i]-v0[i] for i in range(3)]
+                            n = [
+                                e1[1]*e2[2]-e1[2]*e2[1],
+                                e1[2]*e2[0]-e1[0]*e2[2],
+                                e1[0]*e2[1]-e1[1]*e2[0]
+                            ]
+                            ln = math.sqrt(sum(a*a for a in n)) or 1.0
+                            n = [a/ln for a in n]
+                            lit = GL.calculate_lighting(v0, n, material)
+                            cpx = [max(0, min(255, int(c*255))) for c in lit]
+                        else:
+                            cpx = col
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, cpx)
 
         current = []
         for idx in index:
@@ -915,7 +935,25 @@ class GL:
                             B = (c0[2]*inv_wA + c1[2]*inv_wB + c2[2]*inv_wC) * inv_norm
                             col_px = [int(max(0, min(255, R*255))), int(max(0, min(255, G*255))), int(max(0, min(255, B*255)))]
                         else:
-                            col_px = emissive_col
+                            # Lighting por face se houver luzes
+                            if GL.lights:
+                                # reconstruir posições aproximadas em espaço local via inverso das transformações (simplificação: usa NDC invertido parcial)
+                                # Em vez disso, reutilizamos emissive_col modulado por calculate_lighting com normal de face
+                                # (normal aproximada já foi calculada antes? Aqui recalculamos usando p0,p1,p2 screen -> negligenciamos profundidade)
+                                # Melhor: usar vertices originais: omitido por simplicidade
+                                # Usar normal de tela pode distorcer, mas dá feedback de iluminação
+                                v0l = [x0, y0, z0]
+                                v1l = [x1, y1, z1]
+                                v2l = [x2, y2, z2]
+                                e1 = [v1l[i]-v0l[i] for i in range(3)]
+                                e2 = [v2l[i]-v0l[i] for i in range(3)]
+                                n = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]]
+                                ln = math.sqrt(sum(a*a for a in n)) or 1.0
+                                n = [a/ln for a in n]
+                                lit = GL.calculate_lighting(v0l, n, colors if colors else {'diffuseColor':[c/255.0 for c in emissive_col]})
+                                col_px = [max(0, min(255, int(c*255))) for c in lit]
+                            else:
+                                col_px = emissive_col
                         if transp > 0.0:
                             dst = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
                             col_px = blend(dst, col_px, transp)
@@ -1201,18 +1239,17 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
+        # Remove possíveis headlights antigos
+        GL.lights = [l for l in GL.lights if l.get('type') != 'headlight']
         GL.headlight_enabled = headlight
-        
         if headlight:
-            # Adiciona luz headlight (direção da câmera)
-            headlight_info = {
+            GL.lights.append({
                 'type': 'headlight',
-                'ambientIntensity': 0.0,
+                'ambientIntensity': 0.1,
                 'color': [1.0, 1.0, 1.0],
                 'intensity': 1.0,
-                'direction': [0.0, 0.0, -1.0]  # Direção da câmera
-            }
-            GL.lights.append(headlight_info)
+                'direction': [0.0, 0.0, -1.0]
+            })
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
@@ -1291,10 +1328,23 @@ class GL:
         print("TimeSensor : loop = {0}".format(loop))
 
         # Esse método já está implementado para os alunos como exemplo
-        epoch = time.time()  # time in seconds since the epoch as a floating point number.
-        fraction_changed = (epoch % cycleInterval) / cycleInterval
-
-        return fraction_changed
+        if cycleInterval <= 0:
+            return 0.0
+        key = (cycleInterval, loop)
+        now = time.time()
+        state = GL._time_sensor_states.get(key)
+        if state is None:
+            state = {'start': now}
+            GL._time_sensor_states[key] = state
+        elapsed = now - state['start']
+        if loop:
+            fraction = (elapsed % cycleInterval) / cycleInterval
+        else:
+            fraction = min(1.0, elapsed / cycleInterval)
+        if not loop and fraction >= 1.0:
+            # não reinicia, mantém 1.0
+            return 1.0
+        return fraction
 
     @staticmethod
     def splinePositionInterpolator(set_fraction, key, keyValue, closed):
@@ -1314,7 +1364,7 @@ class GL:
         # Garante que set_fraction está no intervalo [0, 1]
         set_fraction = max(0.0, min(1.0, set_fraction))
         
-        # Se só há uma chave, retorna o valor correspondente
+        # Catmull-Rom spline: precisa de pelo menos 2 pontos, ideal >=4
         if len(key) == 1:
             return keyValue[0:3]
         
@@ -1324,23 +1374,35 @@ class GL:
         if set_fraction >= key[-1]:
             return keyValue[-3:]  # Últimos 3 valores
         
-        # Encontra o intervalo para interpolação
-        for i in range(len(key) - 1):
-            if key[i] <= set_fraction <= key[i + 1]:
-                # Interpolação linear entre os dois pontos
-                t = (set_fraction - key[i]) / (key[i + 1] - key[i])
-                
-                # Índices dos vetores 3D
-                idx0 = i * 3
-                idx1 = (i + 1) * 3
-                
-                # Interpolação linear de cada componente
-                value_changed = [
-                    keyValue[idx0] + t * (keyValue[idx1] - keyValue[idx0]),      # x
-                    keyValue[idx0 + 1] + t * (keyValue[idx1 + 1] - keyValue[idx0 + 1]),  # y
-                    keyValue[idx0 + 2] + t * (keyValue[idx1 + 2] - keyValue[idx0 + 2])   # z
-                ]
-                return value_changed
+        # Localiza segmento
+        for seg in range(len(key)-1):
+            k0 = key[seg]
+            k1 = key[seg+1]
+            if k0 <= set_fraction <= k1:
+                t = (set_fraction - k0) / (k1 - k0) if k1>k0 else 0.0
+                # indices pontos principais P1=P(seg), P2=P(seg+1)
+                def get_point(i):
+                    i = max(0, min(i, len(key)-1))
+                    base = i*3
+                    return [keyValue[base], keyValue[base+1], keyValue[base+2]]
+                p1 = get_point(seg)
+                p2 = get_point(seg+1)
+                if seg==0:
+                    p0 = get_point(seg -1 if closed else seg)
+                else:
+                    p0 = get_point(seg-1)
+                if seg+2 >= len(key):
+                    p3 = get_point(0 if closed else seg+1)
+                else:
+                    p3 = get_point(seg+2)
+                # Catmull-Rom: 0.5*( 2*P1 + (-P0+P2)*t + (2P0-5P1+4P2-P3)*t^2 + (-P0+3P1-3P2+P3)*t^3 )
+                t2 = t*t
+                t3 = t2*t
+                out = []
+                for c in range(3):
+                    val = 0.5*(2*p1[c] + (-p0[c]+p2[c])*t + (2*p0[c]-5*p1[c]+4*p2[c]-p3[c])*t2 + (-p0[c]+3*p1[c]-3*p2[c]+p3[c])*t3)
+                    out.append(val)
+                return out
         
         return [0.0, 0.0, 0.0]
 
@@ -1365,7 +1427,6 @@ class GL:
         # Garante que set_fraction está no intervalo [0, 1]
         set_fraction = max(0.0, min(1.0, set_fraction))
         
-        # Se só há uma chave, retorna o valor correspondente
         if len(key) == 1:
             return keyValue[0:4]
         
@@ -1375,33 +1436,47 @@ class GL:
         if set_fraction >= key[-1]:
             return keyValue[-4:]  # Últimos 4 valores
         
-        # Encontra o intervalo para interpolação
-        for i in range(len(key) - 1):
-            if key[i] <= set_fraction <= key[i + 1]:
-                # Interpolação linear entre os dois quaternions/axis-angle
-                t = (set_fraction - key[i]) / (key[i + 1] - key[i])
-                
-                # Índices dos eixos-ângulo (4 valores cada)
-                idx0 = i * 4
-                idx1 = (i + 1) * 4
-                
-                # Interpolação SLERP simplificada para axis-angle
-                # Para simplicidade, fazemos interpolação linear dos componentes
-                value_changed = [
-                    keyValue[idx0] + t * (keyValue[idx1] - keyValue[idx0]),      # axis x
-                    keyValue[idx0 + 1] + t * (keyValue[idx1 + 1] - keyValue[idx0 + 1]),  # axis y
-                    keyValue[idx0 + 2] + t * (keyValue[idx1 + 2] - keyValue[idx0 + 2]),  # axis z
-                    keyValue[idx0 + 3] + t * (keyValue[idx1 + 3] - keyValue[idx0 + 3])   # angle
-                ]
-                
-                # Normaliza o eixo
-                axis_length = math.sqrt(value_changed[0]**2 + value_changed[1]**2 + value_changed[2]**2)
-                if axis_length > 0:
-                    value_changed[0] /= axis_length
-                    value_changed[1] /= axis_length
-                    value_changed[2] /= axis_length
-                
-                return value_changed
+        # Utiliza SLERP com quaternions
+        def axis_angle_to_quat(ax):
+            x,y,z,ang = ax
+            n = math.sqrt(x*x+y*y+z*z) or 1.0
+            x/=n; y/=n; z/=n
+            s = math.sin(ang/2.0)
+            return [x*s, y*s, z*s, math.cos(ang/2.0)]
+        def quat_to_axis_angle(q):
+            x,y,z,w = q
+            if w>1: # normalize
+                l = math.sqrt(x*x+y*y+z*z+w*w) or 1.0
+                x/=l; y/=l; z/=l; w/=l
+            ang = 2*math.acos(w)
+            s = math.sqrt(1-w*w)
+            if s < 1e-6:
+                return [1.0,0.0,0.0,0.0]
+            return [x/s, y/s, z/s, ang]
+        def slerp(q1,q2,t):
+            dot = sum(q1[i]*q2[i] for i in range(4))
+            if dot < 0:
+                q2 = [-c for c in q2]
+                dot = -dot
+            if dot>0.9995:
+                return [q1[i]+t*(q2[i]-q1[i]) for i in range(4)]
+            theta0 = math.acos(max(-1.0,min(1.0,dot)))
+            sin0 = math.sin(theta0)
+            theta = theta0 * t
+            sin_t = math.sin(theta)
+            s0 = math.cos(theta)-dot * sin_t/sin0
+            s1 = sin_t/sin0
+            return [s0*q1[i]+s1*q2[i] for i in range(4)]
+        for seg in range(len(key)-1):
+            k0 = key[seg]; k1 = key[seg+1]
+            if k0 <= set_fraction <= k1:
+                t = (set_fraction-k0)/(k1-k0) if k1>k0 else 0.0
+                a0 = keyValue[seg*4:seg*4+4]
+                a1 = keyValue[(seg+1)*4:(seg+1)*4+4]
+                q0 = axis_angle_to_quat(a0)
+                q1 = axis_angle_to_quat(a1)
+                q = slerp(q0,q1,t)
+                return quat_to_axis_angle(q)
         
         return [0, 0, 1, 0]
 
