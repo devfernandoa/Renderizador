@@ -67,6 +67,7 @@ class Renderizador:
         # Atualiza dimensões da GL para rasterização correta em supersampling
         gl.GL.width = target_w
         gl.GL.height = target_h
+        gl.GL.ssaa_factor = self.ssaa_factor
 
         # Se houver supersampling, SUPER é o alvo de renderização; FRONT mantém resolução nativa
         if self.ssaa_factor > 1:

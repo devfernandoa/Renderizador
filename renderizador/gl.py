@@ -21,6 +21,7 @@ class GL:
 
     width = 800   # largura da tela
     height = 600  # altura da tela
+    ssaa_factor = 1  # fator de supersampling atual (1 = sem SSAA)
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
     transform_stack = []  # pilha para transforms aninhados
@@ -144,11 +145,11 @@ class GL:
         # Conversão de cor emissiva (0..1) para (0..255)
         emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
         r, g, b = [max(0, min(255, int(c * 255))) for c in emissive]
-
-        # Desenha cada ponto
+        f = getattr(GL, 'ssaa_factor', 1)
+        # Desenha cada ponto escalando pelo fator de SSAA para utilizar o framebuffer ampliado
         for i in range(0, len(point), 2):
-            x = int(round(point[i]))
-            y = int(round(point[i + 1]))
+            x = int(round(point[i] * f))
+            y = int(round(point[i + 1] * f))
             if 0 <= x < GL.width and 0 <= y < GL.height:
                 gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, [r, g, b])
         
@@ -161,11 +162,12 @@ class GL:
         emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
         col = [max(0, min(255, int(c * 255))) for c in emissive]
 
-        # Converte lista em lista de pontos inteiros
+        f = getattr(GL, 'ssaa_factor', 1)
+        # Converte lista em lista de pontos inteiros escalados
         pts = []
         for i in range(0, len(lineSegments), 2):
-            x = int(round(lineSegments[i]))
-            y = int(round(lineSegments[i + 1]))
+            x = int(round(lineSegments[i] * f))
+            y = int(round(lineSegments[i + 1] * f))
             pts.append((x, y))
 
         def draw_line(p0, p1):
@@ -195,20 +197,33 @@ class GL:
     @staticmethod
     def circle2D(radius, colors):
         """Função usada para renderizar Circle2D."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry2D.html#Circle2D
-        # Nessa função você receberá um valor de raio e deverá desenhar o contorno de
-        # um círculo.
-        # O parâmetro colors é um dicionário com os tipos cores possíveis, para o Circle2D
-        # você pode assumir o desenho das linhas com a cor emissiva (emissiveColor).
-
-        print("Circle2D : radius = {0}".format(radius)) # imprime no terminal
-        print("Circle2D : colors = {0}".format(colors)) # imprime no terminal as cores
-        
-        # Exemplo:
-        pos_x = GL.width//2
-        pos_y = GL.height//2
-        gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 255])  # altera pixel (u, v, tipo, r, g, b)
-        # cuidado com as cores, o X3D especifica de (0,1) e o Framebuffer de (0,255)
+        if radius is None or radius <= 0:
+            return
+        f = getattr(GL, 'ssaa_factor', 1)
+        emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
+        col = [max(0, min(255, int(c * 255))) for c in emissive]
+        # Centro na tela (usando resolução ampliada já presente em GL.width/height)
+        cx = GL.width // 2
+        cy = GL.height // 2
+        r = int(round(radius * f))
+        # Algoritmo do círculo de ponto médio
+        x = r
+        y = 0
+        d = 1 - r
+        def put(px, py):
+            if 0 <= px < GL.width and 0 <= py < GL.height:
+                gpu.GPU.draw_pixel([px, py], gpu.GPU.RGB8, col)
+        while x >= y:
+            put(cx + x, cy + y); put(cx + y, cy + x)
+            put(cx - y, cy + x); put(cx - x, cy + y)
+            put(cx - x, cy - y); put(cx - y, cy - x)
+            put(cx + y, cy - x); put(cx + x, cy - y)
+            y += 1
+            if d < 0:
+                d += 2 * y + 1
+            else:
+                x -= 1
+                d += 2 * (y - x) + 1
 
 
     @staticmethod
@@ -216,7 +231,7 @@ class GL:
         """Função usada para renderizar TriangleSet2D."""
         if len(vertices) < 6:
             return
-
+        f = getattr(GL, 'ssaa_factor', 1)
         emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
         col = [max(0, min(255, int(c * 255))) for c in emissive]
 
@@ -246,9 +261,9 @@ class GL:
         for i in range(0, len(vertices), 6):
             if i + 5 >= len(vertices):
                 break
-            p0 = (int(round(vertices[i])),     int(round(vertices[i + 1])))
-            p1 = (int(round(vertices[i + 2])), int(round(vertices[i + 3])))
-            p2 = (int(round(vertices[i + 4])), int(round(vertices[i + 5])))
+            p0 = (int(round(vertices[i] * f)),     int(round(vertices[i + 1] * f)))
+            p1 = (int(round(vertices[i + 2] * f)), int(round(vertices[i + 3] * f)))
+            p2 = (int(round(vertices[i + 4] * f)), int(round(vertices[i + 5] * f)))
             draw_filled_triangle(p0, p1, p2)
             
 
