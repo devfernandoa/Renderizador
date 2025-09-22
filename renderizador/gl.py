@@ -50,6 +50,13 @@ class GL:
         shininess = material.get("shininess", 0.2)
         ambient_intensity = material.get("ambientIntensity", 0.2)
         
+        # Se não há luzes, usa apenas ambient + emissive
+        if not GL.lights:
+            ambient = [GL.ambient_light[i] * diffuse[i] * ambient_intensity for i in range(3)]
+            final_color = [emissive[i] + ambient[i] for i in range(3)]
+            final_color = [max(0.0, min(1.0, c)) for c in final_color]
+            return final_color
+        
         # Cor ambiente (global + material)
         ambient = [GL.ambient_light[i] * diffuse[i] * ambient_intensity for i in range(3)]
         # Cor final acumulada inicia com emissive + ambient
@@ -69,25 +76,34 @@ class GL:
                 # Direção da luz (para DirectionalLight é fixa, para headlight é a direção da câmera)
                 light_dir = light['direction']
                 
+                # Componente ambiente da luz
+                la = light.get('ambientIntensity', 0.0)
+                for i in range(3):
+                    final_color[i] += la * light['color'][i] * diffuse[i]
+                
                 # Produto escalar: normal . luz (máximo 0)
                 dot_nl = max(0.0, sum(normal[i] * (-light_dir[i]) for i in range(3)))
                 
                 if dot_nl > 0:
-                    # fator de atenuação usando ambientIntensity da luz (simplificado)
-                    la = light.get('ambientIntensity', 0.0)
-                    # Componente ambiente da luz
-                    for i in range(3):
-                        final_color[i] += la * light['color'][i] * diffuse[i]
-                    # Componente difusa
+                    # Componente difusa (cor principal do material)
                     for i in range(3):
                         final_color[i] += light['intensity'] * light['color'][i] * diffuse[i] * dot_nl
-                    # Componente especular
+                    
+                    # Componente especular (reflexos brilhantes)
                     if any(s > 0 for s in specular) and shininess > 0:
+                        # Calcula direção de reflexão perfeita
                         reflect_dir = [2 * dot_nl * normal[i] - (-light_dir[i]) for i in range(3)]
                         rl = math.sqrt(sum(r*r for r in reflect_dir)) or 1.0
                         reflect_dir = [r/rl for r in reflect_dir]
+                        
+                        # Produto escalar entre reflexão e direção da câmera
                         dot_rv = max(0.0, sum(reflect_dir[i] * view_dir[i] for i in range(3)))
-                        spec_factor = pow(dot_rv, max(1.0, shininess * 128))
+                        
+                        # Fator especular (shininess controla a nitidez do brilho)
+                        spec_exponent = max(1.0, shininess * 128.0)
+                        spec_factor = pow(dot_rv, spec_exponent)
+                        
+                        # Adiciona reflexo especular
                         for i in range(3):
                             final_color[i] += light['intensity'] * light['color'][i] * specular[i] * spec_factor
         
@@ -443,43 +459,24 @@ class GL:
                                     for i in range(3)
                                 ]
                                 
-                                # Sistema de iluminação drasticamente aumentado + correção de cores escuras
+                                # Calcula iluminação correta
                                 if GL.lights and len(GL.lights) > 0:
-                                    # Verifica se há luzes direcionais ou materiais especulares
-                                    has_directional = any(light.get('type') == 'directional' for light in GL.lights)
-                                    has_specular = colors and (colors.get("specularColor", [0,0,0]) != [0,0,0] and colors.get("shininess", 0) > 0)
-                                    
-                                    # Obtém cor base e força cor mais clara para qualquer coisa minimamente escura
-                                    diffuse = colors.get("diffuseColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
-                                    
-                                    if sum(diffuse) < 1.5:
-                                        diffuse = [0.9, 0.9, 1.0]
-                                    
-                                    if GL.is_animation:
-                                        light_factor = 4.0 
-                                        final_col = [max(0, min(255, int(c * light_factor * 255))) for c in diffuse]
-                                    elif has_directional or has_specular:
-                                        lit_color = GL.calculate_lighting(world_pos, world_normal, colors)
-                                        boost_factor = 2.5
-                                        final_col = [max(0, min(255, int(c * boost_factor * 255))) for c in lit_color]
-                                    else:
-                                        # Usa cor difusa com brilho muito forte
-                                        light_factor = 2.0  # 200% de brilho para objetos simples
-                                        final_col = [max(0, min(255, int(c * light_factor * 255))) for c in diffuse]
+                                    # Usa sistema de iluminação Phong completo
+                                    lit_color = GL.calculate_lighting(world_pos, world_normal, colors or {})
+                                    final_col = [max(0, min(255, int(c * 255))) for c in lit_color]
                                 else:
-                                    # Sem luzes - força cor clara e iluminação ambiente MUITO FORTE
-                                    if colors and "diffuseColor" in colors:
-                                        diffuse = colors["diffuseColor"]
+                                    # Sem luzes - usa cor emissiva ou difusa com iluminação ambiente mínima
+                                    if colors and "emissiveColor" in colors:
+                                        base_color = colors["emissiveColor"]
+                                    elif colors and "diffuseColor" in colors:
+                                        base_color = colors["diffuseColor"]
                                     else:
-                                        diffuse = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
+                                        base_color = [0.8, 0.8, 0.8]  # cinza padrão
                                     
-                                    # Se a cor não é bem brilhante, força prata brilhante
-                                    if sum(diffuse) < 1.5:
-                                        diffuse = [0.9, 0.9, 1.0]
-                                    
-                                    # Iluminação ambiente BRUTAL para objetos sem luz
-                                    ambient_factor = 3.0 if GL.is_animation else 2.5  # 300% para animações
-                                    final_col = [max(0, min(255, int(c * ambient_factor * 255))) for c in diffuse]
+                                    # Adiciona luz ambiente mínima
+                                    ambient_factor = 0.3
+                                    final_color = [base_color[i] + GL.ambient_light[i] * ambient_factor for i in range(3)]
+                                    final_col = [max(0, min(255, int(c * 255))) for c in final_color]
                                 
                                 if transp > 0.0:
                                     dst = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
@@ -1144,33 +1141,33 @@ class GL:
                             
                             # Normalizar
                             n_len = math.sqrt(sum(n*n for n in normal)) or 1.0
-                            normal = [n/n_len for n in normal]
+                            face_normal = [n/n_len for n in normal]
                             
-                            # SHADING FORCADO - varia cor baseado na normal
-                            # Se normal aponta para cima (Y+), mais claro
-                            # Se normal aponta para frente (Z+), médio
-                            # Se normal aponta para baixo/trás, mais escuro
-                            facing_up = max(0, normal[1])      # 0-1 baseado em Y+
-                            facing_forward = max(0, normal[2]) # 0-1 baseado em Z+
-                            
-                            # Material base
-                            if colors and "diffuseColor" in colors:
-                                base_diffuse = colors["diffuseColor"]
+                            # Sistema de iluminação Phong correto
+                            if GL.lights and len(GL.lights) > 0:
+                                # Para este pixel, estima posição no espaço mundial
+                                # usando centro do triângulo como aproximação
+                                center_world = [
+                                    (v0_world[i] + v1_world[i] + v2_world[i]) / 3.0
+                                    for i in range(3)
+                                ]
+                                
+                                # Usa a normal da face para iluminação
+                                lit_color = GL.calculate_lighting(center_world, face_normal, colors or {})
+                                col_px = [max(0, min(255, int(c * 255))) for c in lit_color]
                             else:
-                                base_diffuse = [0.8, 0.8, 0.8]
-                            
-                            brightness = sum(base_diffuse) / 3.0
-                            if brightness < 0.3:
-                                lifted_diffuse = [min(1.0, d + 0.3) for d in base_diffuse]
-                            else:
-                                lifted_diffuse = base_diffuse 
-                            
-                            shading_factor = 0.7 + 0.2 * facing_up + 0.1 * facing_forward
-                            shading_factor = max(0.6, min(1.0, shading_factor))  # Entre 0.6-1.0 
-                            
-                            # Aplica shading
-                            final_color = [d * shading_factor for d in lifted_diffuse]
-                            col_px = [max(0, min(255, int(c * 255))) for c in final_color]
+                                # Sem luzes - usa cor do material com iluminação ambiente
+                                if colors and "emissiveColor" in colors:
+                                    base_color = colors["emissiveColor"]
+                                elif colors and "diffuseColor" in colors:
+                                    base_color = colors["diffuseColor"]
+                                else:
+                                    base_color = [0.8, 0.8, 0.8]
+                                
+                                # Adiciona luz ambiente mínima
+                                ambient_factor = 0.3
+                                final_color = [base_color[i] + GL.ambient_light[i] * ambient_factor for i in range(3)]
+                                col_px = [max(0, min(255, int(c * 255))) for c in final_color]
                         if transp > 0.0:
                             dst = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
                             col_px = blend(dst, col_px, transp)
@@ -1458,15 +1455,23 @@ class GL:
 
         # Remove possíveis headlights antigos
         GL.lights = [l for l in GL.lights if l.get('type') != 'headlight']
-        GL.headlight_enabled = headlight
-        if headlight:
-            GL.lights.append({
+        GL.headlight_enabled = bool(headlight)
+        
+        if GL.headlight_enabled:
+            headlight_info = {
                 'type': 'headlight',
-                'ambientIntensity': 0.3,  # Aumentado para mais claridade
+                'ambientIntensity': 0.2,
                 'color': [1.0, 1.0, 1.0],
                 'intensity': 1.0,
                 'direction': [0.0, 0.0, -1.0]
-            })
+            }
+            GL.lights.append(headlight_info)
+            print(f"NavigationInfo: headlight ATIVADO")
+        else:
+            print(f"NavigationInfo: headlight DESATIVADO")
+            
+        # Debug: mostra estado das luzes
+        print(f"Total de luzes ativas: {len(GL.lights)}")
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
@@ -1479,20 +1484,24 @@ class GL:
         # longo de raios paralelos de uma distância infinita.
 
         # Normaliza a direção da luz
-        dir_norm = np.linalg.norm(direction) or 1.0
+        dir_norm = math.sqrt(sum(d*d for d in direction)) or 1.0
         normalized_direction = [d / dir_norm for d in direction]
         
         # Armazena informações da luz direcional
         light_info = {
             'type': 'directional',
-            'ambientIntensity': ambientIntensity,
-            'color': color,
-            'intensity': intensity,
+            'ambientIntensity': float(ambientIntensity),
+            'color': [float(c) for c in color],
+            'intensity': float(intensity),
             'direction': normalized_direction
         }
         
-        # Adiciona à lista de luzes
+        # Adiciona à lista de luzes (remove luzes direcionais anteriores para evitar duplicação)
+        GL.lights = [l for l in GL.lights if l.get('type') != 'directional']
         GL.lights.append(light_info)
+        
+        # Debug: mostra configuração da luz
+        print(f"DirectionalLight configurada: cor={color}, intensidade={intensity}, direção={direction}")
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
@@ -1538,29 +1547,39 @@ class GL:
         # tempo continua a execução no próximo ciclo. O ciclo de um nó TimeSensor dura
         # cycleInterval segundos. O valor de cycleInterval deve ser maior que zero.
 
-        # Deve retornar a fração de tempo passada em fraction_changed
-        
         # Marca que está rodando animação para otimizações
-        GL.is_animation = True  # Corrigir o nome da variável
-        GL.ssaa_factor = 4      # Supersampling 4x4 para ALTA qualidade balanceada (16x mais pixels!)
+        GL.is_animation = True
+        GL.ssaa_factor = 4  # Supersampling 4x4 para qualidade balanceada
 
-        # Esse método já está implementado para os alunos como exemplo
         if cycleInterval <= 0:
             return 0.0
+            
+        # Cria chave única para este sensor
         key = (cycleInterval, loop)
         now = time.time()
         state = GL._time_sensor_states.get(key)
+        
         if state is None:
-            state = {'start': now}
+            state = {'start': now, 'cycles': 0}
             GL._time_sensor_states[key] = state
+            
         elapsed = now - state['start']
+        
         if loop:
-            fraction = (elapsed % cycleInterval) / cycleInterval
+            # Animação em loop
+            cycle_position = elapsed % cycleInterval
+            fraction = cycle_position / cycleInterval
+            current_cycle = int(elapsed // cycleInterval)
+            if current_cycle > state['cycles']:
+                state['cycles'] = current_cycle
+                print(f"TimeSensor: Ciclo {current_cycle}, fração={fraction:.3f}")
         else:
+            # Animação única
             fraction = min(1.0, elapsed / cycleInterval)
-        if not loop and fraction >= 1.0:
-            # não reinicia, mantém 1.0
-            return 1.0
+            if fraction >= 1.0:
+                print(f"TimeSensor: Animação finalizada em {elapsed:.2f}s")
+                return 1.0
+                
         return fraction
 
     @staticmethod
@@ -1570,10 +1589,9 @@ class GL:
         # Interpola não linearmente entre uma lista de vetores 3D. O campo keyValue possui
         # uma lista com os valores a serem interpolados, key possui uma lista respectiva de chaves
         # dos valores em keyValue, a fração a ser interpolada vem de set_fraction que varia de
-        # zeroa a um. O campo keyValue deve conter exatamente tantos vetores 3D quanto os
+        # zero a um. O campo keyValue deve conter exatamente tantos vetores 3D quanto os
         # quadros-chave no key. O campo closed especifica se o interpolador deve tratar a malha
-        # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
-        # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
+        # como fechada, com uma transições da última chave para a primeira chave.
 
         if not key or not keyValue or len(key) == 0:
             return [0.0, 0.0, 0.0]
@@ -1581,51 +1599,69 @@ class GL:
         # Garante que set_fraction está no intervalo [0, 1]
         set_fraction = max(0.0, min(1.0, set_fraction))
         
-        # Catmull-Rom spline: precisa de pelo menos 2 pontos, ideal >=4
+        # Casos simples
         if len(key) == 1:
             return keyValue[0:3]
         
-        # Encontra os índices das chaves para interpolação
+        # Extremos
         if set_fraction <= key[0]:
             return keyValue[0:3]
         if set_fraction >= key[-1]:
-            return keyValue[-3:]  # Últimos 3 valores
+            start_idx = (len(key)-1) * 3
+            return keyValue[start_idx:start_idx+3]
         
-        # Localiza segmento
+        # Encontra segmento de interpolação
         for seg in range(len(key)-1):
             k0 = key[seg]
             k1 = key[seg+1]
             if k0 <= set_fraction <= k1:
-                t = (set_fraction - k0) / (k1 - k0) if k1>k0 else 0.0
-                # indices pontos principais P1=P(seg), P2=P(seg+1)
+                # Parâmetro local t no segmento [0,1]
+                t = (set_fraction - k0) / (k1 - k0) if k1 > k0 else 0.0
+                
+                # Função para obter ponto por índice
                 def get_point(i):
                     i = max(0, min(i, len(key)-1))
-                    base = i*3
+                    base = i * 3
                     return [keyValue[base], keyValue[base+1], keyValue[base+2]]
-                p1 = get_point(seg)
-                p2 = get_point(seg+1)
-                if seg==0:
-                    p0 = get_point(seg -1 if closed else seg)
+                
+                # Pontos para Catmull-Rom spline
+                p1 = get_point(seg)     # ponto atual
+                p2 = get_point(seg+1)   # próximo ponto
+                
+                # Ponto anterior
+                if seg == 0:
+                    p0 = get_point(len(key)-1 if closed else 0)  # primeiro ou último se fechado
                 else:
                     p0 = get_point(seg-1)
+                
+                # Ponto seguinte
                 if seg+2 >= len(key):
-                    p3 = get_point(0 if closed else seg+1)
+                    p3 = get_point(0 if closed else len(key)-1)  # primeiro se fechado
                 else:
                     p3 = get_point(seg+2)
-                # Catmull-Rom: 0.5*( 2*P1 + (-P0+P2)*t + (2P0-5P1+4P2-P3)*t^2 + (-P0+3P1-3P2+P3)*t^3 )
-                t2 = t*t
-                t3 = t2*t
-                out = []
-                for c in range(3):
-                    val = 0.5*(2*p1[c] + (-p0[c]+p2[c])*t + (2*p0[c]-5*p1[c]+4*p2[c]-p3[c])*t2 + (-p0[c]+3*p1[c]-3*p2[c]+p3[c])*t3)
-                    out.append(val)
-                return out
+                
+                # Catmull-Rom spline interpolation
+                # Formula: 0.5 * (2*P1 + (-P0+P2)*t + (2*P0-5*P1+4*P2-P3)*t² + (-P0+3*P1-3*P2+P3)*t³)
+                t2 = t * t
+                t3 = t2 * t
+                
+                result = []
+                for c in range(3):  # x, y, z components
+                    val = 0.5 * (
+                        2 * p1[c] + 
+                        (-p0[c] + p2[c]) * t + 
+                        (2*p0[c] - 5*p1[c] + 4*p2[c] - p3[c]) * t2 + 
+                        (-p0[c] + 3*p1[c] - 3*p2[c] + p3[c]) * t3
+                    )
+                    result.append(val)
+                
+                return result
         
         return [0.0, 0.0, 0.0]
 
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
-        """Interpola entre uma lista de valores de rotação especificos."""
+        """Interpola entre uma lista de valores de rotação específicos."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/interpolators.html#OrientationInterpolator
         # Interpola rotações são absolutas no espaço do objeto e, portanto, não são cumulativas.
         # Uma orientação representa a posição final de um objeto após a aplicação de uma rotação.
@@ -1635,67 +1671,103 @@ class GL:
         # orientações forem diagonalmente opostas. O campo keyValue possui uma lista com os
         # valores a serem interpolados, key possui uma lista respectiva de chaves
         # dos valores em keyValue, a fração a ser interpolada vem de set_fraction que varia de
-        # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
+        # zero a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
         # quadros-chave no key.
 
         if not key or not keyValue or len(key) == 0:
-            return [0, 0, 1, 0]
+            return [0, 0, 1, 0]  # rotação padrão (eixo Z, ângulo 0)
         
         # Garante que set_fraction está no intervalo [0, 1]
         set_fraction = max(0.0, min(1.0, set_fraction))
         
+        # Caso simples: apenas uma chave
         if len(key) == 1:
             return keyValue[0:4]
         
-        # Encontra os índices das chaves para interpolação
+        # Extremos
         if set_fraction <= key[0]:
             return keyValue[0:4]
         if set_fraction >= key[-1]:
-            return keyValue[-4:]  # Últimos 4 valores
+            start_idx = (len(key)-1) * 4
+            return keyValue[start_idx:start_idx+4]
         
-        # Utiliza SLERP com quaternions
-        def axis_angle_to_quat(ax):
-            x,y,z,ang = ax
-            n = math.sqrt(x*x+y*y+z*z) or 1.0
-            x/=n; y/=n; z/=n
-            s = math.sin(ang/2.0)
-            return [x*s, y*s, z*s, math.cos(ang/2.0)]
-        def quat_to_axis_angle(q):
-            x,y,z,w = q
-            if w>1: # normalize
-                l = math.sqrt(x*x+y*y+z*z+w*w) or 1.0
-                x/=l; y/=l; z/=l; w/=l
-            ang = 2*math.acos(w)
-            s = math.sqrt(1-w*w)
-            if s < 1e-6:
-                return [1.0,0.0,0.0,0.0]
-            return [x/s, y/s, z/s, ang]
-        def slerp(q1,q2,t):
-            dot = sum(q1[i]*q2[i] for i in range(4))
+        # Funções auxiliares para interpolação spherical linear (SLERP)
+        def axis_angle_to_quat(axis_angle):
+            """Converte eixo-ângulo para quaternion."""
+            x, y, z, angle = axis_angle
+            norm = math.sqrt(x*x + y*y + z*z) or 1.0
+            x, y, z = x/norm, y/norm, z/norm
+            half_angle = angle / 2.0
+            sin_half = math.sin(half_angle)
+            return [x*sin_half, y*sin_half, z*sin_half, math.cos(half_angle)]
+        
+        def quat_to_axis_angle(quat):
+            """Converte quaternion para eixo-ângulo."""
+            x, y, z, w = quat
+            # Normaliza quaternion
+            norm = math.sqrt(x*x + y*y + z*z + w*w) or 1.0
+            x, y, z, w = x/norm, y/norm, z/norm, w/norm
+            
+            # Calcula ângulo
+            angle = 2 * math.acos(min(1.0, abs(w)))
+            sin_half = math.sqrt(1 - w*w)
+            
+            if sin_half < 1e-6:  # Quase sem rotação
+                return [1.0, 0.0, 0.0, 0.0]
+            
+            return [x/sin_half, y/sin_half, z/sin_half, angle]
+        
+        def slerp(q1, q2, t):
+            """Spherical Linear Interpolation entre dois quaternions."""
+            dot = sum(q1[i] * q2[i] for i in range(4))
+            
+            # Se dot produto negativo, negate um quaternion para tomar caminho mais curto
             if dot < 0:
                 q2 = [-c for c in q2]
                 dot = -dot
-            if dot>0.9995:
-                return [q1[i]+t*(q2[i]-q1[i]) for i in range(4)]
-            theta0 = math.acos(max(-1.0,min(1.0,dot)))
-            sin0 = math.sin(theta0)
-            theta = theta0 * t
-            sin_t = math.sin(theta)
-            s0 = math.cos(theta)-dot * sin_t/sin0
-            s1 = sin_t/sin0
-            return [s0*q1[i]+s1*q2[i] for i in range(4)]
-        for seg in range(len(key)-1):
-            k0 = key[seg]; k1 = key[seg+1]
-            if k0 <= set_fraction <= k1:
-                t = (set_fraction-k0)/(k1-k0) if k1>k0 else 0.0
-                a0 = keyValue[seg*4:seg*4+4]
-                a1 = keyValue[(seg+1)*4:(seg+1)*4+4]
-                q0 = axis_angle_to_quat(a0)
-                q1 = axis_angle_to_quat(a1)
-                q = slerp(q0,q1,t)
-                return quat_to_axis_angle(q)
+            
+            # Se quaternions muito próximos, usa interpolação linear
+            if dot > 0.9995:
+                result = [q1[i] + t * (q2[i] - q1[i]) for i in range(4)]
+                # Normaliza resultado
+                norm = math.sqrt(sum(r*r for r in result)) or 1.0
+                return [r/norm for r in result]
+            
+            # Calcula ângulo entre quaternions
+            theta_0 = math.acos(max(-1.0, min(1.0, abs(dot))))
+            sin_theta_0 = math.sin(theta_0)
+            theta = theta_0 * t
+            sin_theta = math.sin(theta)
+            
+            s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+            s1 = sin_theta / sin_theta_0
+            
+            return [s0 * q1[i] + s1 * q2[i] for i in range(4)]
         
-        return [0, 0, 1, 0]
+        # Encontra segmento de interpolação
+        for seg in range(len(key) - 1):
+            k0, k1 = key[seg], key[seg + 1]
+            if k0 <= set_fraction <= k1:
+                # Parâmetro local t no segmento [0,1]
+                t = (set_fraction - k0) / (k1 - k0) if k1 > k0 else 0.0
+                
+                # Obtém orientações do segmento
+                start_idx = seg * 4
+                end_idx = (seg + 1) * 4
+                orientation1 = keyValue[start_idx:start_idx+4]
+                orientation2 = keyValue[end_idx:end_idx+4]
+                
+                # Converte para quaternions
+                q1 = axis_angle_to_quat(orientation1)
+                q2 = axis_angle_to_quat(orientation2)
+                
+                # Interpola usando SLERP
+                interpolated_quat = slerp(q1, q2, t)
+                
+                # Converte de volta para eixo-ângulo
+                return quat_to_axis_angle(interpolated_quat)
+        
+        return [0, 0, 1, 0]  # Fallback
 
     # Para o futuro (Não para versão atual do projeto.)
     def vertex_shader(self, shader):
