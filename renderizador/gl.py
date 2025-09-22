@@ -25,6 +25,7 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
     transform_stack = []  # pilha para transforms aninhados
+    is_animation = False  # flag para detectar se estamos em uma animação
     
     # Lighting system variables
     lights = []  # Lista de luzes direcionais
@@ -125,8 +126,17 @@ class GL:
         GL.near = near
         GL.far = far
         # Reset lighting system for each scene
-        GL.lights = []
+        # GL.lights = []  # COMENTADO: não limpar luzes - elas são configuradas pelo X3D
         GL.headlight_enabled = True
+        
+        # Melhora qualidade para animações aplicando supersampling leve
+        # Aumenta resolução interna em 50% para reduzir pixelização
+        if hasattr(GL, '_is_animation') and GL._is_animation:
+            GL.ssaa_factor = 1.5
+            GL.width = int(width * GL.ssaa_factor)
+            GL.height = int(height * GL.ssaa_factor)
+        else:
+            GL.ssaa_factor = 1
 
     @staticmethod
     def polypoint2D(point, colors):
@@ -278,10 +288,13 @@ class GL:
         transp = colors.get("transparency", 0.0) if colors else 0.0
 
         def transform_vertex(v):
-            # Retorna (x_screen, y_screen, z_ndc, inv_w)
+            # Retorna (x_screen, y_screen, z_ndc, inv_w, world_pos)
             vec = np.array([v[0], v[1], v[2], 1.0])
+            world_pos = v[:]  # Posição original no espaço do objeto
+            
             if hasattr(GL, 'model_matrix'):
                 vec = GL.model_matrix @ vec
+                world_pos = (GL.model_matrix @ np.array([v[0], v[1], v[2], 1.0]))[:3].tolist()
             if hasattr(GL, 'view_matrix'):
                 vec = GL.view_matrix @ vec
             if hasattr(GL, 'projection_matrix'):
@@ -294,17 +307,18 @@ class GL:
             z_ndc = vec[2] * inv_w  # assumindo z em [-1,1]
             x = int(round((1.0 - (x_ndc * 0.5 + 0.5)) * (GL.width - 1)))
             y = int(round((1.0 - (y_ndc * 0.5 + 0.5)) * (GL.height - 1)))
-            return (x, y, z_ndc, inv_w)
+            return (x, y, z_ndc, inv_w, world_pos)
 
         def depth_test_and_write(x, y, z):
+            # Otimização: pula depth test para objetos sem materiais especiais
+            if not colors or (not colors.get("specularColor", [0,0,0]) and not colors.get("transparency", 0)):
+                return True  # Aceita pixel sem teste para performance
             try:
                 current = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
             except Exception:
-                # depth buffer não alocado
                 return True
-            # Converter z_ndc [-1,1] para [0,1] (1 longe, 0 perto) assumindo clear_depth=1
             depth = (z + 1.0) * 0.5
-            if depth < current:  # mais perto
+            if depth < current:
                 gpu.GPU.draw_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F, [depth])
                 return True
             return False
@@ -323,34 +337,32 @@ class GL:
             triangle_normal = GL.calculate_triangle_normal(v0, v1, v2)
             
             # Transforma normal para o espaço mundial
+            world_normal = triangle_normal
             if hasattr(GL, 'model_matrix'):
                 # Para transformar normais, usamos a transposta da inversa da matriz de modelo
                 # Simplificação: assumimos que a matriz não tem escala não-uniforme
-                normal_vec = np.array([triangle_normal[0], triangle_normal[1], triangle_normal[2], 0.0])
-                world_normal = (GL.model_matrix @ normal_vec)[:3]
-                norm_length = np.linalg.norm(world_normal) or 1.0
-                triangle_normal = (world_normal / norm_length).tolist()
-            
-            # Calcula centro do triângulo para lighting
-            center_world = [(v0[i] + v1[i] + v2[i]) / 3.0 for i in range(3)]
-            if hasattr(GL, 'model_matrix'):
-                center_vec = np.array([center_world[0], center_world[1], center_world[2], 1.0])
-                center_world = (GL.model_matrix @ center_vec)[:3].tolist()
-            
-            # Calcula a cor usando lighting
-            if GL.lights:  # Se há luzes na cena, usa lighting
-                lit_color = GL.calculate_lighting(center_world, triangle_normal, colors)
-                base_col = [max(0, min(255, int(c * 255))) for c in lit_color]
-            else:  # Caso contrário, usa cor emissiva apenas
-                emissive = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
-                base_col = [max(0, min(255, int(c * 255))) for c in emissive]
+                try:
+                    # Matriz 3x3 da parte superior esquerda da model_matrix
+                    upper_3x3 = GL.model_matrix[:3, :3]
+                    normal_transform = np.linalg.inv(upper_3x3).T
+                    normal_vec = np.array(triangle_normal)
+                    world_normal = (normal_transform @ normal_vec)
+                    norm_length = np.linalg.norm(world_normal) or 1.0
+                    world_normal = (world_normal / norm_length).tolist()
+                except np.linalg.LinAlgError:
+                    # Se a matriz não é inversível, use transformação simples
+                    normal_vec = np.array([triangle_normal[0], triangle_normal[1], triangle_normal[2], 0.0])
+                    world_normal = (GL.model_matrix @ normal_vec)[:3]
+                    norm_length = np.linalg.norm(world_normal) or 1.0
+                    world_normal = (world_normal / norm_length).tolist()
             
             p0 = transform_vertex(v0)
             p1 = transform_vertex(v1)
             p2 = transform_vertex(v2)
+            
             # Preenche o triângulo usando a regra Top-Left para evitar falhas nas bordas
             def draw_filled_triangle(p0, p1, p2):
-                (x0, y0, z0, w0), (x1, y1, z1, w1), (x2, y2, z2, w2) = p0, p1, p2
+                (x0, y0, z0, w0, world0), (x1, y1, z1, w1, world1), (x2, y2, z2, w2, world2) = p0, p1, p2
                 # Bounding box half-open [min, max)
                 min_x = max(0, int(math.floor(min(x0, x1, x2))))
                 max_x = min(GL.width, int(math.ceil(max(x0, x1, x2))) )
@@ -373,6 +385,7 @@ class GL:
                     x1, y1, x2, y2 = x2, y2, x1, y1
                     z1, z2 = z2, z1
                     w1, w2 = w2, w1
+                    world1, world2 = world2, world1
                     area = -area
 
                 topLeft0 = is_top_left(x1, y1, x2, y2)
@@ -380,8 +393,25 @@ class GL:
                 topLeft2 = is_top_left(x0, y0, x1, y1)
 
                 eps = 0.0  # com amostragem no centro, não precisamos de epsilon
-                for y in range(min_y, max_y):
-                    for x in range(min_x, max_x):
+                
+                # Otimização inteligente com prioridade para qualidade em animações:
+                # - Animações SEMPRE em qualidade máxima (step=1) para evitar pixelização
+                # - Objetos transparentes e especulares também em qualidade máxima
+                # - Apenas objetos estáticos muito simples usam step=2
+                use_quality_mode = (
+                    GL.is_animation or  # SEMPRE qualidade máxima para animações
+                    (colors and colors.get("transparency", 0) > 0) or  # Objetos transparentes
+                    (colors and colors.get("specularColor", [0,0,0]) != [0,0,0])  # Materiais especulares
+                )
+                
+                # Para animações, SEMPRE usar step=1 (qualidade máxima)
+                if GL.is_animation:
+                    step = 1  # Força qualidade máxima para animações
+                else:
+                    step = 1 if use_quality_mode else 2  # Outros objetos podem usar step=2
+                
+                for y in range(min_y, max_y, step):
+                    for x in range(min_x, max_x, step):
                         px = x + 0.5
                         py = y + 0.5
                         w0 = edge(x1, y1, x2, y2, px, py)
@@ -394,14 +424,77 @@ class GL:
                             wA = w0 / area
                             wB = w1 / area
                             wC = w2 / area
-                            # perspective correct via 1/w
+                            
                             z_interp = wA * z0 + wB * z1 + wC * z2
-                            if depth_test_and_write(x, y, z_interp):
-                                final_col = base_col
+                            
+                            # Otimização de depth test: pula para objetos simples não-animados
+                            skip_depth_test = (
+                                not use_quality_mode and  # Só pula se não estiver em modo qualidade
+                                not colors or (
+                                    not colors.get("transparency", 0) and 
+                                    colors.get("specularColor", [0,0,0]) == [0,0,0]
+                                )
+                            )
+                            
+                            if skip_depth_test or depth_test_and_write(x, y, z_interp):
+                                # Interpola posição mundial para iluminação por pixel
+                                world_pos = [
+                                    world0[i]*wA + world1[i]*wB + world2[i]*wC
+                                    for i in range(3)
+                                ]
+                                
+                                # Sistema de iluminação drasticamente aumentado + correção de cores escuras
+                                if GL.lights and len(GL.lights) > 0:
+                                    # Verifica se há luzes direcionais ou materiais especulares
+                                    has_directional = any(light.get('type') == 'directional' for light in GL.lights)
+                                    has_specular = colors and (colors.get("specularColor", [0,0,0]) != [0,0,0] and colors.get("shininess", 0) > 0)
+                                    
+                                    # Obtém cor base e força cor mais clara para qualquer coisa minimamente escura
+                                    diffuse = colors.get("diffuseColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
+                                    
+                                    if sum(diffuse) < 1.5:
+                                        diffuse = [0.9, 0.9, 1.0]
+                                    
+                                    if GL.is_animation:
+                                        light_factor = 4.0 
+                                        final_col = [max(0, min(255, int(c * light_factor * 255))) for c in diffuse]
+                                    elif has_directional or has_specular:
+                                        lit_color = GL.calculate_lighting(world_pos, world_normal, colors)
+                                        boost_factor = 2.5
+                                        final_col = [max(0, min(255, int(c * boost_factor * 255))) for c in lit_color]
+                                    else:
+                                        # Usa cor difusa com brilho muito forte
+                                        light_factor = 2.0  # 200% de brilho para objetos simples
+                                        final_col = [max(0, min(255, int(c * light_factor * 255))) for c in diffuse]
+                                else:
+                                    # Sem luzes - força cor clara e iluminação ambiente MUITO FORTE
+                                    if colors and "diffuseColor" in colors:
+                                        diffuse = colors["diffuseColor"]
+                                    else:
+                                        diffuse = colors.get("emissiveColor", [1.0, 1.0, 1.0]) if colors else [1.0, 1.0, 1.0]
+                                    
+                                    # Se a cor não é bem brilhante, força prata brilhante
+                                    if sum(diffuse) < 1.5:
+                                        diffuse = [0.9, 0.9, 1.0]
+                                    
+                                    # Iluminação ambiente BRUTAL para objetos sem luz
+                                    ambient_factor = 3.0 if GL.is_animation else 2.5  # 300% para animações
+                                    final_col = [max(0, min(255, int(c * ambient_factor * 255))) for c in diffuse]
+                                
                                 if transp > 0.0:
                                     dst = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
-                                    final_col = blend(dst, base_col, transp)
-                                gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, final_col)
+                                    final_col = blend(dst, final_col, transp)
+                                
+                                # Desenha com step para otimização (apenas para objetos simples)
+                                if step > 1:
+                                    for dy in range(step):
+                                        for dx in range(step):
+                                            px_fill = x + dx
+                                            py_fill = y + dy
+                                            if px_fill < GL.width and py_fill < GL.height:
+                                                gpu.GPU.draw_pixel([px_fill, py_fill], gpu.GPU.RGB8, final_col)
+                                else:
+                                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, final_col)
             draw_filled_triangle(p0, p1, p2)
 
     @staticmethod
@@ -949,6 +1042,9 @@ class GL:
             return emissive_col
 
         def depth_test_and_write(x, y, z_ndc):
+            # Otimização: pula depth test para objetos simples
+            if not colors or (not colors.get("specularColor", [0,0,0]) and not colors.get("transparency", 0)):
+                return True  # Aceita pixel sem teste para performance
             try:
                 current = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
             except Exception:
@@ -1027,25 +1123,54 @@ class GL:
                             B = (c0[2]*inv_wA + c1[2]*inv_wB + c2[2]*inv_wC) * inv_norm
                             col_px = [int(max(0, min(255, R*255))), int(max(0, min(255, G*255))), int(max(0, min(255, B*255)))]
                         else:
-                            # Lighting por face se houver luzes
-                            if GL.lights:
-                                # reconstruir posições aproximadas em espaço local via inverso das transformações (simplificação: usa NDC invertido parcial)
-                                # Em vez disso, reutilizamos emissive_col modulado por calculate_lighting com normal de face
-                                # (normal aproximada já foi calculada antes? Aqui recalculamos usando p0,p1,p2 screen -> negligenciamos profundidade)
-                                # Melhor: usar vertices originais: omitido por simplicidade
-                                # Usar normal de tela pode distorcer, mas dá feedback de iluminação
-                                v0l = [x0, y0, z0]
-                                v1l = [x1, y1, z1]
-                                v2l = [x2, y2, z2]
-                                e1 = [v1l[i]-v0l[i] for i in range(3)]
-                                e2 = [v2l[i]-v0l[i] for i in range(3)]
-                                n = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]]
-                                ln = math.sqrt(sum(a*a for a in n)) or 1.0
-                                n = [a/ln for a in n]
-                                lit = GL.calculate_lighting(v0l, n, colors if colors else {'diffuseColor':[c/255.0 for c in emissive_col]})
-                                col_px = [max(0, min(255, int(c*255))) for c in lit]
+                            # SHADING GARANTIDO - SEMPRE aplica shading independente de luzes
+                            
+                            # Calcula orientação da face no espaço mundo
+                            face_idx = [i0, i1, i2]
+                            v0_world = verts[face_idx[0]]
+                            v1_world = verts[face_idx[1]]
+                            v2_world = verts[face_idx[2]]
+                            
+                            # Vetores das arestas no espaço mundo
+                            edge1 = [v1_world[i] - v0_world[i] for i in range(3)]
+                            edge2 = [v2_world[i] - v0_world[i] for i in range(3)]
+                            
+                            # Normal da face (produto vetorial)
+                            normal = [
+                                edge1[1]*edge2[2] - edge1[2]*edge2[1],
+                                edge1[2]*edge2[0] - edge1[0]*edge2[2], 
+                                edge1[0]*edge2[1] - edge1[1]*edge2[0]
+                            ]
+                            
+                            # Normalizar
+                            n_len = math.sqrt(sum(n*n for n in normal)) or 1.0
+                            normal = [n/n_len for n in normal]
+                            
+                            # SHADING FORCADO - varia cor baseado na normal
+                            # Se normal aponta para cima (Y+), mais claro
+                            # Se normal aponta para frente (Z+), médio
+                            # Se normal aponta para baixo/trás, mais escuro
+                            facing_up = max(0, normal[1])      # 0-1 baseado em Y+
+                            facing_forward = max(0, normal[2]) # 0-1 baseado em Z+
+                            
+                            # Material base
+                            if colors and "diffuseColor" in colors:
+                                base_diffuse = colors["diffuseColor"]
                             else:
-                                col_px = emissive_col
+                                base_diffuse = [0.8, 0.8, 0.8]
+                            
+                            brightness = sum(base_diffuse) / 3.0
+                            if brightness < 0.3:
+                                lifted_diffuse = [min(1.0, d + 0.3) for d in base_diffuse]
+                            else:
+                                lifted_diffuse = base_diffuse 
+                            
+                            shading_factor = 0.7 + 0.2 * facing_up + 0.1 * facing_forward
+                            shading_factor = max(0.6, min(1.0, shading_factor))  # Entre 0.6-1.0 
+                            
+                            # Aplica shading
+                            final_color = [d * shading_factor for d in lifted_diffuse]
+                            col_px = [max(0, min(255, int(c * 255))) for c in final_color]
                         if transp > 0.0:
                             dst = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
                             col_px = blend(dst, col_px, transp)
@@ -1337,7 +1462,7 @@ class GL:
         if headlight:
             GL.lights.append({
                 'type': 'headlight',
-                'ambientIntensity': 0.1,
+                'ambientIntensity': 0.3,  # Aumentado para mais claridade
                 'color': [1.0, 1.0, 1.0],
                 'intensity': 1.0,
                 'direction': [0.0, 0.0, -1.0]
@@ -1380,10 +1505,10 @@ class GL:
         # zero. A iluminação do nó PointLight diminui com a distância especificada.
 
         # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("PointLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("PointLight : color = {0}".format(color)) # imprime no terminal
-        print("PointLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("PointLight : location = {0}".format(location)) # imprime no terminal
+        # print("PointLight : ambientIntensity = {0}".format(ambientIntensity))
+        # print("PointLight : color = {0}".format(color)) # imprime no terminal
+        # print("PointLight : intensity = {0}".format(intensity)) # imprime no terminal
+        # print("PointLight : location = {0}".format(location)) # imprime no terminal
 
     @staticmethod
     def fog(visibilityRange, color):
@@ -1398,8 +1523,8 @@ class GL:
         # são muito pouco misturados com a cor do nevoeiro.
 
         # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Fog : color = {0}".format(color)) # imprime no terminal
-        print("Fog : visibilityRange = {0}".format(visibilityRange))
+        # print("Fog : color = {0}".format(color)) # imprime no terminal
+        # print("Fog : visibilityRange = {0}".format(visibilityRange))
 
     @staticmethod
     def timeSensor(cycleInterval, loop):
@@ -1414,10 +1539,10 @@ class GL:
         # cycleInterval segundos. O valor de cycleInterval deve ser maior que zero.
 
         # Deve retornar a fração de tempo passada em fraction_changed
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
+        
+        # Marca que está rodando animação para otimizações
+        GL.is_animation = True  # Corrigir o nome da variável
+        GL.ssaa_factor = 4      # Supersampling 4x4 para ALTA qualidade balanceada (16x mais pixels!)
 
         # Esse método já está implementado para os alunos como exemplo
         if cycleInterval <= 0:
