@@ -54,14 +54,19 @@ class GL:
         # Cor final acumulada inicia com emissive + ambient
         final_color = [emissive[i] + ambient[i] for i in range(3)]
         
+        # Vetor do observador para specular (do ponto até câmera)
+        if hasattr(GL, 'camera_position'):
+            view_dir = [GL.camera_position[i] - world_pos[i] for i in range(3)]
+            vlen = math.sqrt(sum(v*v for v in view_dir)) or 1.0
+            view_dir = [v / vlen for v in view_dir]
+        else:
+            view_dir = [0.0, 0.0, 1.0]
+
         # Calcular contribuição de cada luz
         for light in GL.lights:
             if light['type'] in ['directional', 'headlight']:
                 # Direção da luz (para DirectionalLight é fixa, para headlight é a direção da câmera)
                 light_dir = light['direction']
-                if light['type'] == 'headlight' and hasattr(GL, 'view_matrix'):
-                    # Transforma direção da luz pelo espaço da câmera
-                    light_dir = [0.0, 0.0, -1.0]  # Sempre para frente na câmera
                 
                 # Produto escalar: normal . luz (máximo 0)
                 dot_nl = max(0.0, sum(normal[i] * (-light_dir[i]) for i in range(3)))
@@ -77,7 +82,6 @@ class GL:
                         final_color[i] += light['intensity'] * light['color'][i] * diffuse[i] * dot_nl
                     # Componente especular
                     if any(s > 0 for s in specular) and shininess > 0:
-                        view_dir = [0.0, 0.0, 1.0]
                         reflect_dir = [2 * dot_nl * normal[i] - (-light_dir[i]) for i in range(3)]
                         rl = math.sqrt(sum(r*r for r in reflect_dir)) or 1.0
                         reflect_dir = [r/rl for r in reflect_dir]
@@ -447,6 +451,8 @@ class GL:
             return m
 
         GL.view_matrix = look_at(eye, center, up)
+        # Armazena direção forward da câmera para uso pelo headlight
+        GL.camera_forward = (fwd / (np.linalg.norm(fwd) or 1.0)).tolist()
 
         # projeção
         aspect = GL.width / GL.height
@@ -460,6 +466,25 @@ class GL:
         proj[2, 3] = (2 * far * near) / (near - far)
         proj[3, 2] = -1.0
         GL.projection_matrix = proj
+
+        # Atualiza (ou cria) direção do headlight para seguir a câmera
+        if GL.headlight_enabled:
+            headlight = None
+            for l in GL.lights:
+                if l.get('type') == 'headlight':
+                    headlight = l
+                    break
+            if headlight is None:
+                headlight = {
+                    'type': 'headlight',
+                    'ambientIntensity': 0.0,
+                    'color': [1.0, 1.0, 1.0],
+                    'intensity': 1.0,
+                    'direction': [0.0, 0.0, -1.0]
+                }
+                GL.lights.append(headlight)
+            # atualiza direção
+            headlight['direction'] = GL.camera_forward
         
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -517,6 +542,36 @@ class GL:
         for i in range(0, len(point), 3):
             verts.append([point[i], point[i+1], point[i+2]])
 
+        # Pré-calcula normais por vértice (acumuladas) para todas as tiras
+        vert_normals = [[0.0,0.0,0.0] for _ in verts]
+        idx_offset = 0
+        # Construir índices completos das tiras primeiro
+        strip_vertices = []  # lista de listas com índices de cada tira
+        cursor = 0
+        for count in stripCount:
+            indices = list(range(cursor, cursor+count))
+            strip_vertices.append(indices)
+            cursor += count
+        # Para cada tira acumulamos as normais de cada triângulo
+        for indices in strip_vertices:
+            for i in range(len(indices)-2):
+                i0, i1, i2 = indices[i], indices[i+1], indices[i+2]
+                if i % 2 == 1:  # alternância de orientação
+                    i0, i1 = i1, i0
+                v0 = verts[i0]; v1 = verts[i1]; v2 = verts[i2]
+                e1 = [v1[j]-v0[j] for j in range(3)]
+                e2 = [v2[j]-v0[j] for j in range(3)]
+                n = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]]
+                # acumula
+                for vid in (i0,i1,i2):
+                    vert_normals[vid][0] += n[0]
+                    vert_normals[vid][1] += n[1]
+                    vert_normals[vid][2] += n[2]
+        # Normaliza
+        for n in vert_normals:
+            l = math.sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]) or 1.0
+            n[0]/=l; n[1]/=l; n[2]/=l
+
         def transform_vertex(v):
             vec = np.array([v[0], v[1], v[2], 1.0])
             if hasattr(GL, 'model_matrix'):
@@ -531,7 +586,7 @@ class GL:
             y = int(round((1.0 - (vec[1] * 0.5 + 0.5)) * (GL.height - 1)))
             return (x, y, vec[2], v)
 
-        def fill_triangle(p0, p1, p2):
+        def fill_triangle(p0, p1, p2, c0, c1, c2):
             (x0, y0, z0, v0), (x1, y1, z1, v1), (x2, y2, z2, v2) = p0, p1, p2
             min_x = max(0, int(math.floor(min(x0, x1, x2))))
             max_x = min(GL.width, int(math.ceil(max(x0, x1, x2))))
@@ -568,22 +623,19 @@ class GL:
                        (w1 > 0 or (w1 == 0 and topLeft1)) and \
                        (w2 > 0 or (w2 == 0 and topLeft2)):
                         # Usa normal de face para lighting se houver luz
-                        if GL.lights:
-                            # normal em espaço local
-                            e1 = [v1[i]-v0[i] for i in range(3)]
-                            e2 = [v2[i]-v0[i] for i in range(3)]
-                            n = [
-                                e1[1]*e2[2]-e1[2]*e2[1],
-                                e1[2]*e2[0]-e1[0]*e2[2],
-                                e1[0]*e2[1]-e1[1]*e2[0]
-                            ]
-                            ln = math.sqrt(sum(a*a for a in n)) or 1.0
-                            n = [a/ln for a in n]
-                            lit = GL.calculate_lighting(v0, n, material)
-                            cpx = [max(0, min(255, int(c*255))) for c in lit]
-                        else:
-                            cpx = col
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, cpx)
+                        # Interpola cores (Gouraud)
+                        # Usa áreas baricêntricas para pesos
+                        area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+                        if area == 0:
+                            continue
+                        w0 = (x1 - x) * (y2 - y) - (y1 - y) * (x2 - x)
+                        w1 = (x2 - x) * (y0 - y) - (y2 - y) * (x0 - x)
+                        w2 = (x0 - x) * (y1 - y) - (y0 - y) * (x1 - x)
+                        w0 /= area; w1 /= area; w2 /= area
+                        R = c0[0]*w0 + c1[0]*w1 + c2[0]*w2
+                        Gc = c0[1]*w0 + c1[1]*w1 + c2[1]*w2
+                        Bc = c0[2]*w0 + c1[2]*w1 + c2[2]*w2
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, [int(R), int(Gc), int(Bc)])
 
         base = 0
         for count in stripCount:
@@ -601,7 +653,19 @@ class GL:
                 p0 = transform_vertex(verts[order[0]])
                 p1 = transform_vertex(verts[order[1]])
                 p2 = transform_vertex(verts[order[2]])
-                fill_triangle(p0, p1, p2)
+                if GL.lights:
+                    # Calcula cor iluminada por vértice
+                    def lit_color(vid):
+                        n = vert_normals[vid]
+                        vpos = verts[vid]
+                        lc = GL.calculate_lighting(vpos, n, material)
+                        return [max(0, min(255, int(c*255))) for c in lc]
+                    c0 = lit_color(order[0])
+                    c1 = lit_color(order[1])
+                    c2 = lit_color(order[2])
+                else:
+                    c0 = c1 = c2 = col
+                fill_triangle(p0, p1, p2, c0, c1, c2)
             base += count
 
     @staticmethod
@@ -619,6 +683,39 @@ class GL:
         for i in range(0, len(point), 3):
             verts.append([point[i], point[i+1], point[i+2]])
 
+        # Construir tiras (listas de índices) a partir de index separado por -1
+        strips = []
+        current = []
+        for idx in index:
+            if idx == -1:
+                if len(current) >= 3:
+                    strips.append(current)
+                current = []
+            else:
+                if 0 <= idx < len(verts):
+                    current.append(idx)
+        if len(current) >= 3:
+            strips.append(current)
+
+        # Normais por vértice acumuladas
+        vert_normals = [[0.0,0.0,0.0] for _ in verts]
+        for strip in strips:
+            for i in range(len(strip)-2):
+                i0,i1,i2 = strip[i], strip[i+1], strip[i+2]
+                if i % 2 == 1:
+                    i0,i1 = i1,i0
+                v0 = verts[i0]; v1 = verts[i1]; v2 = verts[i2]
+                e1 = [v1[j]-v0[j] for j in range(3)]
+                e2 = [v2[j]-v0[j] for j in range(3)]
+                n = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]]
+                for vid in (i0,i1,i2):
+                    vert_normals[vid][0]+=n[0]
+                    vert_normals[vid][1]+=n[1]
+                    vert_normals[vid][2]+=n[2]
+        for n in vert_normals:
+            l = math.sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]) or 1.0
+            n[0]/=l; n[1]/=l; n[2]/=l
+
         def transform_vertex(v):
             vec = np.array([v[0], v[1], v[2], 1.0])
             if hasattr(GL, 'model_matrix'):
@@ -633,7 +730,7 @@ class GL:
             y = int(round((1.0 - (vec[1] * 0.5 + 0.5)) * (GL.height - 1)))
             return (x, y, vec[2], v)
 
-        def fill_triangle(p0, p1, p2):
+        def fill_triangle(p0, p1, p2, c0, c1, c2):
             (x0, y0, z0, v0), (x1, y1, z1, v1), (x2, y2, z2, v2) = p0, p1, p2
             min_x = max(0, int(math.floor(min(x0, x1, x2))))
             max_x = min(GL.width, int(math.ceil(max(x0, x1, x2))))
@@ -668,45 +765,40 @@ class GL:
                     if (w0 > 0 or (w0 == 0 and topLeft0)) and \
                        (w1 > 0 or (w1 == 0 and topLeft1)) and \
                        (w2 > 0 or (w2 == 0 and topLeft2)):
-                        if GL.lights:
-                            e1 = [v1[i]-v0[i] for i in range(3)]
-                            e2 = [v2[i]-v0[i] for i in range(3)]
-                            n = [
-                                e1[1]*e2[2]-e1[2]*e2[1],
-                                e1[2]*e2[0]-e1[0]*e2[2],
-                                e1[0]*e2[1]-e1[1]*e2[0]
-                            ]
-                            ln = math.sqrt(sum(a*a for a in n)) or 1.0
-                            n = [a/ln for a in n]
-                            lit = GL.calculate_lighting(v0, n, material)
-                            cpx = [max(0, min(255, int(c*255))) for c in lit]
-                        else:
-                            cpx = col
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, cpx)
+                        # Interpolação de cores Gouraud
+                        area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+                        if area == 0:
+                            continue
+                        w0 = (x1 - x) * (y2 - y) - (y1 - y) * (x2 - x)
+                        w1 = (x2 - x) * (y0 - y) - (y2 - y) * (x0 - x)
+                        w2 = (x0 - x) * (y1 - y) - (y0 - y) * (x1 - x)
+                        w0 /= area; w1 /= area; w2 /= area
+                        R = c0[0]*w0 + c1[0]*w1 + c2[0]*w2
+                        Gc = c0[1]*w0 + c1[1]*w1 + c2[1]*w2
+                        Bc = c0[2]*w0 + c1[2]*w1 + c2[2]*w2
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, [int(R), int(Gc), int(Bc)])
 
-        current = []
-        for idx in index:
-            if idx == -1:
-                if len(current) >= 3:
-                    for i in range(len(current) - 2):
-                        i0, i1, i2 = current[i], current[i+1], current[i+2]
-                        order = (i0, i1, i2) if (i % 2 == 0) else (i1, i0, i2)
-                        p0 = transform_vertex(verts[order[0]])
-                        p1 = transform_vertex(verts[order[1]])
-                        p2 = transform_vertex(verts[order[2]])
-                        fill_triangle(p0, p1, p2)
-                current = []
-            else:
-                if 0 <= idx < len(verts):
-                    current.append(idx)
-        if len(current) >= 3:
-            for i in range(len(current) - 2):
-                i0, i1, i2 = current[i], current[i+1], current[i+2]
-                order = (i0, i1, i2) if (i % 2 == 0) else (i1, i0, i2)
+        for strip in strips:
+            for i in range(len(strip)-2):
+                i0,i1,i2 = strip[i], strip[i+1], strip[i+2]
+                if i % 2 == 1:
+                    i0,i1 = i1,i0
+                order = (i0,i1,i2)
                 p0 = transform_vertex(verts[order[0]])
                 p1 = transform_vertex(verts[order[1]])
                 p2 = transform_vertex(verts[order[2]])
-                fill_triangle(p0, p1, p2)
+                if GL.lights:
+                    def lit_color(vid):
+                        n = vert_normals[vid]
+                        vpos = verts[vid]
+                        lc = GL.calculate_lighting(vpos, n, material)
+                        return [max(0, min(255, int(c*255))) for c in lc]
+                    c0 = lit_color(order[0])
+                    c1 = lit_color(order[1])
+                    c2 = lit_color(order[2])
+                else:
+                    c0 = c1 = c2 = col
+                fill_triangle(p0, p1, p2, c0, c1, c2)
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
