@@ -39,7 +39,7 @@ class GL:
         if not normal or len(normal) != 3:
             return material.get("diffuseColor", [0.8, 0.8, 0.8])
         
-        # Normaliza a normal
+        # Normaliza a normal (que pessimo isso)
         norm_length = math.sqrt(sum(n*n for n in normal)) or 1.0
         normal = [n / norm_length for n in normal]
         
@@ -63,6 +63,8 @@ class GL:
         final_color = [emissive[i] + ambient[i] for i in range(3)]
         
         # Vetor do observador para specular (do ponto até câmera)
+        # O vetor observador precisa apontar do ponto na superfície para a câmera (observador) 
+        # para que o produto escalar com o vetor refletido represente o cosseno do ângulo entre os dois.
         if hasattr(GL, 'camera_position'):
             view_dir = [GL.camera_position[i] - world_pos[i] for i in range(3)]
             vlen = math.sqrt(sum(v*v for v in view_dir)) or 1.0
@@ -185,6 +187,7 @@ class GL:
             y = int(round(lineSegments[i + 1] * f))
             pts.append((x, y))
 
+        # com algoritmo de Bresenham pra corrigir o erro acumulado
         def draw_line(p0, p1):
             x0, y0 = p0
             x1, y1 = p1
@@ -304,6 +307,7 @@ class GL:
         transp = colors.get("transparency", 0.0) if colors else 0.0
 
         def transform_vertex(v):
+            # transforma um vértice 3D do espaço do objeto até a tela (pixel).
             # Retorna (x_screen, y_screen, z_ndc, inv_w, world_pos)
             vec = np.array([v[0], v[1], v[2], 1.0])
             world_pos = v[:]  # Posição original no espaço do objeto
@@ -532,8 +536,9 @@ class GL:
             f = f / (np.linalg.norm(f) or 1.0)
             s = np.cross(up, f)
             s = s / (np.linalg.norm(s) or 1.0)
-            u = np.cross(f, s)
+            u = np.cross(f, s) # na base ortonormal
             m = np.identity(4)
+            # monta a matriz que leva o ponto eye até a origem
             m[0, :3] = s
             m[1, :3] = u
             m[2, :3] = -f
@@ -1024,6 +1029,7 @@ class GL:
                 return 0
 
         def sample_tex(u, v, level):
+            # Retorna a cor do texel
             if mipmaps is None:
                 return emissive_col
             level = int(max(0, min(level, len(mipmaps)-1)))
@@ -1121,7 +1127,7 @@ class GL:
                             col_px = [int(max(0, min(255, R*255))), int(max(0, min(255, G*255))), int(max(0, min(255, B*255)))]
                         else:
                             # SHADING GARANTIDO - SEMPRE aplica shading independente de luzes
-                            
+                            # Calcluando o shading da face mesmo que não tenha UVs
                             # Calcula orientação da face no espaço mundo
                             face_idx = [i0, i1, i2]
                             v0_world = verts[face_idx[0]]
@@ -1584,7 +1590,7 @@ class GL:
 
     @staticmethod
     def splinePositionInterpolator(set_fraction, key, keyValue, closed):
-        """Interpola não linearmente entre uma lista de vetores 3D."""
+        """Interpola não linearmente entre uma lista de vetores 3D. Usando Catmull-Rom spline."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/interpolators.html#SplinePositionInterpolator
         # Interpola não linearmente entre uma lista de vetores 3D. O campo keyValue possui
         # uma lista com os valores a serem interpolados, key possui uma lista respectiva de chaves
